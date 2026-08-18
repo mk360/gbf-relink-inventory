@@ -23,6 +23,7 @@ func ReadMemory(handle windows.Handle, address uintptr, size uintptr) []byte {
 	)
 	if ret == 0 {
 		log.Println("ReadProcessMemory failed:", err)
+		return []byte{}
 	}
 	return buffer
 }
@@ -30,12 +31,11 @@ func ReadMemory(handle windows.Handle, address uintptr, size uintptr) []byte {
 func WriteMemory(handle windows.Handle, address uintptr, data []byte) {
 	dataLen := len(data)
 	procWrite := kernel32.MustFindProc("WriteProcessMemory")
-	_, _, err := procWrite.Call(
+	procWrite.Call(
 		uintptr(handle),
 		address,
 		uintptr(unsafe.Pointer(&data[0])),
 		uintptr(dataLen),
 		uintptr(unsafe.Pointer(&dataLen)),
 	)
-	log.Println(err)
 }

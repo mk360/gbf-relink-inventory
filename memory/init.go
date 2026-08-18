@@ -82,7 +82,8 @@ type ModuleInfo struct {
 
 const memMEM_PRIVATE = 0x20000
 
-func searchForPattern(handle windows.Handle, module ModuleInfo, pattern []patternByte, final_address_channel chan uintptr) {
+func searchForPattern(handle windows.Handle, module ModuleInfo, pattern []patternByte) []uintptr {
+	results := []uintptr{}
 	buf := ReadMemory(handle, module.BaseAddress, module.Size)
 	bufLen := len(buf)
 	for i := 0; i <= bufLen-len(pattern); i++ {
@@ -97,40 +98,27 @@ func searchForPattern(handle windows.Handle, module ModuleInfo, pattern []patter
 			}
 		}
 		if match {
-			select {
-			case final_address_channel <- module.BaseAddress + uintptr(i):
-			default:
-			}
+			results = append(results, module.BaseAddress+uintptr(i))
 		}
 	}
+	return results
 }
 
-func ScanMemory(handle windows.Handle, pattern string) (uintptr, error) {
-	log.Println("Searching for pattern", pattern)
-	pat := parsePattern(pattern)
-	patLen := len(pat)
-	final_address_channel := make(chan uintptr, 1)
-	job_channel := make(chan ModuleInfo)
-	wg := sync.WaitGroup{}
+func getModules(handle windows.Handle, pattern_length int) []ModuleInfo {
 	address := uintptr(0)
 	maxAddress := uintptr(0x7FFFFFFEFFFF)
-	var modulesList = []ModuleInfo{}
+	var modules_list = []ModuleInfo{}
 
 	for address < maxAddress {
 		var mbi windows.MemoryBasicInformation
-
 		if err := windows.VirtualQueryEx(handle, address, &mbi, 48); err != nil {
-			// can't query further
-			// stop walking rather than looping forever
 			break
 		}
-
 		isHeap := mbi.State == windows.MEM_COMMIT &&
 			mbi.Type == memMEM_PRIVATE &&
 			mbi.Protect == windows.PAGE_READWRITE
-
-		if isHeap && mbi.RegionSize >= uintptr(patLen) {
-			modulesList = append(modulesList, ModuleInfo{
+		if isHeap && mbi.RegionSize >= uintptr(pattern_length) {
+			modules_list = append(modules_list, ModuleInfo{
 				BaseAddress: mbi.BaseAddress,
 				Size:        mbi.RegionSize,
 			})
@@ -138,25 +126,42 @@ func ScanMemory(handle windows.Handle, pattern string) (uintptr, error) {
 		address = mbi.BaseAddress + mbi.RegionSize
 	}
 
+	return modules_list
+}
+
+func ScanMemory(handle windows.Handle, pattern string) []uintptr {
+	log.Println("Searching for pattern", pattern)
+	pat := parsePattern(pattern)
+	patLen := len(pat)
+	matches_channel := make(chan []uintptr)
+	matches := []uintptr{}
+	job_channel := make(chan ModuleInfo)
+	var workers_wg sync.WaitGroup
+	var collector_wg sync.WaitGroup
+
+	collector_wg.Go(func() {
+		for sub_matches := range matches_channel {
+			matches = append(matches, sub_matches...)
+		}
+	})
+
 	for range runtime.NumCPU() {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		workers_wg.Go(func() {
 			for module := range job_channel {
-				searchForPattern(handle, module, pat, final_address_channel)
+				sub_matches := searchForPattern(handle, module, pat)
+				matches_channel <- sub_matches
 			}
-		}()
+		})
 	}
 
+	modulesList := getModules(handle, patLen)
 	for _, module := range modulesList {
 		job_channel <- module
 	}
+
 	close(job_channel)
-	wg.Wait()
-	select {
-	case addr := <-final_address_channel:
-		return addr, nil
-	default:
-		return 0, fmt.Errorf("pattern not found in any heap region")
-	}
+	workers_wg.Wait()
+	close(matches_channel)
+	collector_wg.Wait()
+	return matches
 }
